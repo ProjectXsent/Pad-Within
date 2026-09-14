@@ -57,6 +57,7 @@ void Config_Load(const char* iniName)
     g_cfg.enableLog = GetB("General", "EnableLog", g_cfg.enableLog, p);
     g_cfg.passthrough = GetB("General", "Passthrough", g_cfg.passthrough, p);
     g_cfg.controllerIndex = GetI("General", "ControllerIndex", g_cfg.controllerIndex, p);
+    g_cfg.allowRawFallback = GetB("General", "AllowRawFallback", g_cfg.allowRawFallback, p);
 
     g_cfg.cameraSensitivity = GetI("Sensitivity", "CameraSensitivity", g_cfg.cameraSensitivity, p);
     g_cfg.moveDeadzone     = GetF("Sensitivity", "MoveDeadzone",     g_cfg.moveDeadzone,     p);
@@ -71,6 +72,7 @@ void Config_Load(const char* iniName)
     g_cfg.invertCameraX = GetB("Axes", "InvertCameraX", g_cfg.invertCameraX, p);
     g_cfg.swapTriggers  = GetB("Axes", "SwapTriggers",  g_cfg.swapTriggers,  p);
     g_cfg.cameraOnZRz   = GetB("Axes", "CameraOnZRz",   g_cfg.cameraOnZRz,   p);
+    g_cfg.triggersAsButtons = GetB("Axes", "TriggersAsButtons", g_cfg.triggersAsButtons, p);
 
     g_cfg.spoofVidPid = GetB("Spoof", "SpoofVidPid", g_cfg.spoofVidPid, p);
     {
@@ -90,8 +92,8 @@ void Config_Load(const char* iniName)
     g_cfg.btnY     = GetI("Buttons", "Y",     g_cfg.btnY,     p);
     g_cfg.btnLB    = GetI("Buttons", "LB",    g_cfg.btnLB,    p);
     g_cfg.btnRB    = GetI("Buttons", "RB",    g_cfg.btnRB,    p);
-    g_cfg.btnStart = GetI("Buttons", "Start", g_cfg.btnStart, p);
     g_cfg.btnBack  = GetI("Buttons", "Back",  g_cfg.btnBack,  p);
+    g_cfg.btnStart = GetI("Buttons", "Start", g_cfg.btnStart, p);
     g_cfg.btnLS    = GetI("Buttons", "LS",    g_cfg.btnLS,    p);
     g_cfg.btnRS    = GetI("Buttons", "RS",    g_cfg.btnRS,    p);
 

@@ -15,7 +15,13 @@ struct Config
     // --- controller selection ---
     // Which controller to use when several are present. -1 = auto (pick the one
     // actually sending input). Otherwise the SDL device index.
-    int  controllerIndex = -1;
+    int  controllerIndex = -1; // -1 = auto (pick the pad actually sending input)
+
+    // Opt-in only: read an unmapped pad as a raw SDL_Joystick with a blind
+    // numeric axis/button guess, if it never gets a proper GameController
+    // mapping. Off by default - see README's hidapi troubleshooting section
+    // before reaching for this; it's a guess, not a calibrated mapping.
+    bool allowRawFallback = false;
 
     // --- sensitivity / feel ---
     // Movement (left stick) has no speed multiplier — only deadzone/calibration
@@ -46,6 +52,12 @@ struct Config
     // If false: RT -> Z(+), LT -> Z(-).  If true: swapped.
     bool swapTriggers = false;
 
+    // --- triggers as DirectInput buttons
+    bool triggersAsButtons = false;
+    int   btnLT = 6;   // 0-indexed -> "Button 7"
+    int   btnRT = 7;   // 0-indexed -> "Button 8"
+    float triggerButtonThreshold = 0.5f;
+
     // --- axis routing (which DIJOYSTATE fields the sticks/triggers write) ---
     // Some games read the right stick on Z/Rz instead of Rx/Ry. Toggle if the
     // camera stick behaves wrong.
@@ -71,10 +83,12 @@ struct Config
     int btnY  = 3;   // Btn4  Grab/2nd weapon
     int btnLB = 4;   // Btn5  Rewind/Slowdown
     int btnRB = 5;   // Btn6  Walling/Block
-    int btnStart = 7;   // Btn8  Start
-    int btnBack  = 11;  // Btn12 Navigation Map
-    int btnLS = 8;   // Btn9  (free / Walk toggle)
-    int btnRS = 9;   // Btn10 Reset Camera
+    //int btnLT = 6;   // Btn9  (free / Walk toggle)
+    //int btnRT = 7;   // Btn10 Reset Camera
+    int btnBack = 8;  // Btn12 Navigation Map
+    int btnStart = 9;   // Btn8  Start
+    int btnLS = 10;   // Btn9  (free / Walk toggle)
+    int btnRS = 11;   // Btn10 Reset Camera
 };
 
 // Global config instance.
