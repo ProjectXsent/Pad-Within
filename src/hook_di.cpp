@@ -468,10 +468,293 @@ static bool IsJoystickGuid(REFGUID g)
     return !IsEqualGUID(g, GUID_SysMouse) && !IsEqualGUID(g, GUID_SysKeyboard);
 }
 
+// =============================================================================
+//  Fully synthetic joystick device
+//
+//  If the game enumerates DirectInput BEFORE any physical controller is
+//  plugged in, the real dinput8.dll reports zero joystick-class devices, so
+//  Hook_CreateDevice never gets a real device to patch and the game never
+//  polls anything for the rest of the session (EnumDevicesThunk below is
+//  what notices this and injects GUID_ProxyVirtualJoystick as a fake
+//  enumerated device so the game always gets SOME joystick object).
+//
+//  This device only speaks the plain DIJOYSTATE format (offsets 0/4/8/12/
+//  16/20 for X/Y/Z/Rx/Ry/Rz, 32 for POV, 48+i for buttons) - the same
+//  layout Proxy_FillJoyState() already assumes for the real-device path via
+//  g_axisOfs. Since there's no real hardware behind this device, we DEFINE
+//  that as its native layout via our own EnumObjects and never need to
+//  capture/remap anything, unlike the DevAxisMap dance used for real
+//  devices with non-standard layouts (see Hook_EnumObjects above).
+//
+//  Deliberately unsupported / stubbed: force feedback, buffered
+//  GetDeviceData (same limitation as the real-device path), action mapping,
+//  image info. None of these matter for a simple polled DIJOYSTATE reader.
+// =============================================================================
+
+// {5B1E3A2E-7C1B-4E58-9F5B-6D6E1C0B2AA1} - arbitrary but fixed; only needs to
+// be a value EnumDevicesThunk and Hook_CreateDevice agree on.
+static const GUID GUID_ProxyVirtualJoystick =
+{ 0x5b1e3a2e, 0x7c1b, 0x4e58, { 0x9f, 0x5b, 0x6d, 0x6e, 0x1c, 0x0b, 0x2a, 0xa1 } };
+
+static void FillStandardAxisOffsets(AxisOffsets& m)
+{
+    static const int stdOfs[6] = { 0, 4, 8, 12, 16, 20 };
+    for (int i = 0; i < 6; ++i) m.ofs[i] = stdOfs[i];
+    m.povOfs = 32;
+    for (int i = 0; i < 32; ++i) m.btnOfs[i] = 48 + i;
+}
+
+class VirtualJoystickDevice : public IDirectInputDevice8A
+{
+public:
+    VirtualJoystickDevice() : m_refCount(1), m_acquired(false), m_dataSize(0),
+                               m_bufferSize(0), m_hEvent(nullptr) {}
+
+    // --- IUnknown ---
+    STDMETHODIMP QueryInterface(REFIID riid, LPVOID* ppv) override
+    {
+        if (!ppv) return E_POINTER;
+        if (IsEqualIID(riid, IID_IUnknown) ||
+            IsEqualIID(riid, IID_IDirectInputDeviceA) ||
+            IsEqualIID(riid, IID_IDirectInputDevice2A) ||
+            IsEqualIID(riid, IID_IDirectInputDevice7A) ||
+            IsEqualIID(riid, IID_IDirectInputDevice8A)) {
+            *ppv = this; AddRef(); return S_OK;
+        }
+        *ppv = nullptr; return E_NOINTERFACE;
+    }
+    STDMETHODIMP_(ULONG) AddRef() override { return (ULONG)InterlockedIncrement(&m_refCount); }
+    STDMETHODIMP_(ULONG) Release() override
+    {
+        LONG r = InterlockedDecrement(&m_refCount);
+        if (r == 0) delete this;
+        return (ULONG)r;
+    }
+
+    // --- capabilities / enumeration ---
+    STDMETHODIMP GetCapabilities(LPDIDEVCAPS caps) override
+    {
+        if (!caps || (caps->dwSize != sizeof(DIDEVCAPS))) return DIERR_INVALIDPARAM;
+        ZeroMemory(caps, sizeof(DIDEVCAPS));
+        caps->dwSize    = sizeof(DIDEVCAPS);
+        caps->dwFlags   = DIDC_ATTACHED | DIDC_EMULATED;
+        caps->dwDevType = DI8DEVTYPE_GAMEPAD | (DI8DEVTYPEGAMEPAD_STANDARD << 8);
+        caps->dwAxes    = 6;
+        caps->dwButtons = 32;
+        caps->dwPOVs    = 1;
+        return DI_OK;
+    }
+
+    STDMETHODIMP EnumObjects(LPDIENUMDEVICEOBJECTSCALLBACKA cb, LPVOID ctx, DWORD flags) override
+    {
+        if (!cb) return DIERR_INVALIDPARAM;
+        struct { REFGUID guid; DWORD ofs; const char* name; } axes[] = {
+            { GUID_XAxis, 0,  "X Axis"  }, { GUID_YAxis,  4,  "Y Axis"  },
+            { GUID_ZAxis, 8,  "Z Axis"  }, { GUID_RxAxis, 12, "X Rotation" },
+            { GUID_RyAxis,16, "Y Rotation" }, { GUID_RzAxis, 20, "Z Rotation" },
+        };
+        if (flags == DIDFT_ALL || (flags & DIDFT_AXIS)) {
+            for (int i = 0; i < 6; ++i) {
+                DIDEVICEOBJECTINSTANCEA o = {};
+                o.dwSize = sizeof(o);
+                o.guidType = axes[i].guid;
+                o.dwOfs = axes[i].ofs;
+                o.dwType = DIDFT_MAKEINSTANCE(i) | DIDFT_ABSAXIS;
+                lstrcpynA(o.tszName, axes[i].name, sizeof(o.tszName));
+                if (cb(&o, ctx) == DIENUM_STOP) return DI_OK;
+            }
+        }
+        if (flags == DIDFT_ALL || (flags & DIDFT_POV)) {
+            DIDEVICEOBJECTINSTANCEA o = {};
+            o.dwSize = sizeof(o);
+            o.guidType = GUID_POV;
+            o.dwOfs = 32;
+            o.dwType = DIDFT_MAKEINSTANCE(0) | DIDFT_POV;
+            lstrcpynA(o.tszName, "Hat Switch", sizeof(o.tszName));
+            if (cb(&o, ctx) == DIENUM_STOP) return DI_OK;
+        }
+        if (flags == DIDFT_ALL || (flags & DIDFT_BUTTON)) {
+            for (int i = 0; i < 32; ++i) {
+                DIDEVICEOBJECTINSTANCEA o = {};
+                o.dwSize = sizeof(o);
+                o.guidType = GUID_Button;
+                o.dwOfs = 48 + i;
+                o.dwType = DIDFT_MAKEINSTANCE(i) | DIDFT_PSHBUTTON;
+                char name[32]; snprintf(name, sizeof(name), "Button %d", i);
+                lstrcpynA(o.tszName, name, sizeof(o.tszName));
+                if (cb(&o, ctx) == DIENUM_STOP) return DI_OK;
+            }
+        }
+        return DI_OK;
+    }
+
+    STDMETHODIMP GetObjectInfo(LPDIDEVICEOBJECTINSTANCEA, DWORD, DWORD) override
+    {
+        return DIERR_INVALIDPARAM;   // not exercised by a polled joystick reader
+    }
+
+    // --- properties ---
+    STDMETHODIMP GetProperty(REFGUID rguidProp, LPDIPROPHEADER pdiph) override
+    {
+        if (!pdiph) return DIERR_INVALIDPARAM;
+        if (&rguidProp == &DIPROP_VIDPID && pdiph->dwSize >= sizeof(DIPROPDWORD)) {
+            DIPROPDWORD* pd = reinterpret_cast<DIPROPDWORD*>(pdiph);
+            // Same spoof identity Hook_GetProperty uses for real devices -
+            // fall back to a real Xbox 360 controller's VID/PID even with
+            // SpoofVidPid off, since this device has no "real" id to keep.
+            WORD vid = g_cfg.spoofVidPid ? (WORD)g_cfg.spoofVID : 0x045E;
+            WORD pid = g_cfg.spoofVidPid && g_cfg.spoofPID ? (WORD)g_cfg.spoofPID : 0x028E;
+            pd->dwData = MAKELONG(vid, pid);
+            return DI_OK;
+        }
+        if (&rguidProp == &DIPROP_RANGE && pdiph->dwSize >= sizeof(DIPROPRANGE)) {
+            DIPROPRANGE* pr = reinterpret_cast<DIPROPRANGE*>(pdiph);
+            pr->lMin = -32768; pr->lMax = 32767;
+            return DI_OK;
+        }
+        return DIERR_UNSUPPORTED;
+    }
+    STDMETHODIMP SetProperty(REFGUID rguidProp, LPCDIPROPHEADER pdiph) override
+    {
+        // Range/deadzone are meaningless here (Proxy_FillJoyState applies its
+        // own), accept and ignore. Buffer size is tracked purely so
+        // GetDeviceData can distinguish "unbuffered" from "buffered, nothing
+        // pending" below.
+        if (&rguidProp == &DIPROP_BUFFERSIZE && pdiph && pdiph->dwSize >= sizeof(DIPROPDWORD))
+            m_bufferSize = reinterpret_cast<const DIPROPDWORD*>(pdiph)->dwData;
+        return DI_OK;
+    }
+
+    // --- acquisition ---
+    STDMETHODIMP Acquire() override
+    {
+        m_acquired = true;
+        LOG("Acquire dev=%p (VIRTUAL) hr=DI_OK", (void*)this);
+        return DI_OK;
+    }
+    STDMETHODIMP Unacquire() override { m_acquired = false; return DI_OK; }
+    STDMETHODIMP SetCooperativeLevel(HWND, DWORD) override { return DI_OK; }
+    STDMETHODIMP Initialize(HINSTANCE, DWORD, REFGUID) override { return DI_OK; }
+
+    // --- state ---
+    STDMETHODIMP GetDeviceState(DWORD cbData, LPVOID lpvData) override
+    {
+        if (!lpvData) return DIERR_INVALIDPARAM;
+#ifdef POP2_DIAG
+        // Diagnostic build: same "log, never overwrite" contract the real-
+        // device path uses - nothing to compare against here since there's
+        // no native hardware backing this device, but keep the behavior
+        // symmetric rather than silently synthesizing in a diag build.
+        static DWORD lastLog = 0; DWORD now = GetTickCount();
+        if (now - lastLog > 250) {
+            lastLog = now;
+            LOG("GetDeviceState[VIRTUAL JOY dev=%p]: cbData=%lu", (void*)this, (unsigned long)cbData);
+        }
+        return DI_OK;
+#else
+        if (!m_acquired) return DIERR_NOTACQUIRED;
+        extern bool Proxy_LogEnabled();
+        if (Proxy_LogEnabled()) {
+            static DWORD lastLog = 0; DWORD now = GetTickCount();
+            if (now - lastLog > 500) { lastLog = now; LOG("poll VIRTUAL JOY dev=%p cbData=%lu", (void*)this, (unsigned long)cbData); }
+        }
+        ZeroMemory(lpvData, cbData);
+        if (cbData != sizeof(DIJOYSTATE)) return DI_OK;   // this device only speaks DIJOYSTATE
+        // This device advertised the plain/standard layout via EnumObjects
+        // above (there's no real hardware to capture offsets from), so make
+        // sure Proxy_FillJoyState writes to exactly that layout.
+        FillStandardAxisOffsets(g_axisOfs);
+        Proxy_FillJoyState(reinterpret_cast<DIJOYSTATE*>(lpvData));
+        return DI_OK;
+#endif
+    }
+    STDMETHODIMP GetDeviceData(DWORD, LPDIDEVICEOBJECTDATA, LPDWORD pdwInOut, DWORD) override
+    {
+        // No buffered-mode event synthesis (same limitation noted on the
+        // real-device GetDeviceData hook). Fail per the real API contract if
+        // buffered mode was never turned on; otherwise "nothing pending".
+        if (m_bufferSize == 0) return DIERR_NOTBUFFERED;
+        if (pdwInOut) *pdwInOut = 0;
+        return DI_OK;
+    }
+    STDMETHODIMP SetDataFormat(LPCDIDATAFORMAT fmt) override
+    {
+        if (!fmt) return DIERR_INVALIDPARAM;
+        m_dataSize = fmt->dwDataSize;
+        LOG("VirtualJoystickDevice::SetDataFormat dev=%p: dwDataSize=%lu numObjs=%lu",
+            (void*)this, (unsigned long)fmt->dwDataSize, (unsigned long)fmt->dwNumObjs);
+        return DI_OK;
+    }
+    STDMETHODIMP SetEventNotification(HANDLE hEvent) override
+    {
+        m_hEvent = hEvent;
+        LOG("SetEventNotification dev=%p (VIRTUAL) hEvent=%p", (void*)this, (void*)hEvent);
+        return DI_OK;
+    }
+    STDMETHODIMP Poll() override { return DI_OK; }
+
+    STDMETHODIMP GetDeviceInfo(LPDIDEVICEINSTANCEA info) override
+    {
+        if (!info || info->dwSize != sizeof(DIDEVICEINSTANCEA)) return DIERR_INVALIDPARAM;
+        FillInstance(*info);
+        return DI_OK;
+    }
+    STDMETHODIMP RunControlPanel(HWND, DWORD) override { return DI_OK; }
+
+    // --- unsupported: force feedback / buffered file I/O / action mapping ---
+    STDMETHODIMP CreateEffect(REFGUID, LPCDIEFFECT, LPDIRECTINPUTEFFECT*, LPUNKNOWN) override { return DIERR_UNSUPPORTED; }
+    STDMETHODIMP EnumEffects(LPDIENUMEFFECTSCALLBACKA, LPVOID, DWORD) override { return DI_OK; }
+    STDMETHODIMP GetEffectInfo(LPDIEFFECTINFOA, REFGUID) override { return DIERR_UNSUPPORTED; }
+    STDMETHODIMP GetForceFeedbackState(LPDWORD) override { return DIERR_UNSUPPORTED; }
+    STDMETHODIMP SendForceFeedbackCommand(DWORD) override { return DIERR_UNSUPPORTED; }
+    STDMETHODIMP EnumCreatedEffectObjects(LPDIENUMCREATEDEFFECTOBJECTSCALLBACK, LPVOID, DWORD) override { return DI_OK; }
+    STDMETHODIMP Escape(LPDIEFFESCAPE) override { return DIERR_UNSUPPORTED; }
+    STDMETHODIMP SendDeviceData(DWORD, LPCDIDEVICEOBJECTDATA, LPDWORD, DWORD) override { return DIERR_UNSUPPORTED; }
+    STDMETHODIMP EnumEffectsInFile(LPCSTR, LPDIENUMEFFECTSINFILECALLBACK, LPVOID, DWORD) override { return DIERR_UNSUPPORTED; }
+    STDMETHODIMP WriteEffectToFile(LPCSTR, DWORD, LPDIFILEEFFECT, DWORD) override { return DIERR_UNSUPPORTED; }
+    STDMETHODIMP BuildActionMap(LPDIACTIONFORMATA, LPCSTR, DWORD) override { return DIERR_UNSUPPORTED; }
+    STDMETHODIMP SetActionMap(LPDIACTIONFORMATA, LPCSTR, DWORD) override { return DIERR_UNSUPPORTED; }
+    STDMETHODIMP GetImageInfo(LPDIDEVICEIMAGEINFOHEADERA) override { return DIERR_UNSUPPORTED; }
+
+    static void FillInstance(DIDEVICEINSTANCEA& inst)
+    {
+        ZeroMemory(&inst, sizeof(inst));
+        inst.dwSize = sizeof(inst);
+        inst.guidInstance = GUID_ProxyVirtualJoystick;
+        inst.guidProduct  = GUID_ProxyVirtualJoystick;
+        inst.dwDevType = DI8DEVTYPE_GAMEPAD | (DI8DEVTYPEGAMEPAD_STANDARD << 8);
+        lstrcpynA(inst.tszInstanceName, "Proxy Virtual Controller", sizeof(inst.tszInstanceName));
+        const char* name = g_cfg.spoofVidPid ? "Controller (XBOX 360 For Windows)" : "Proxy Virtual Controller";
+        lstrcpynA(inst.tszProductName, name, sizeof(inst.tszProductName));
+    }
+
+private:
+    LONG   m_refCount;
+    bool   m_acquired;
+    DWORD  m_dataSize;
+    DWORD  m_bufferSize;
+    HANDLE m_hEvent;
+};
+
 // ---------------------------------------------------------------------------
 static HRESULT STDMETHODCALLTYPE Hook_CreateDevice(
     IDirectInput8* self, REFGUID rguid, LPDIRECTINPUTDEVICE8* out, LPUNKNOWN outer)
 {
+    if (out && IsEqualGUID(rguid, GUID_ProxyVirtualJoystick)) {
+        // No real device backs this GUID - it was injected by EnumDevicesThunk
+        // because nothing was physically attached at enumeration time. Hand
+        // back our own COM object instead of forwarding to the real
+        // CreateDevice (which has never heard of this GUID and would fail).
+        VirtualJoystickDevice* vdev = new VirtualJoystickDevice();
+        *out = vdev;
+        if (g_joyDeviceCount < 8) {
+            g_joyDevices[g_joyDeviceCount++] = vdev;
+            LOG("CreateDevice: fabricated VIRTUAL joystick device %p (total joy devices=%d)",
+                (void*)vdev, g_joyDeviceCount);
+        }
+        return DI_OK;
+    }
+
     HRESULT hr = g_origCreateDevice(self, rguid, out, outer);
     LOG("CreateDevice guid=%s -> hr=0x%08lX dev=%p",
         GuidName(rguid), hr, (out ? *out : nullptr));
@@ -521,12 +804,15 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateDevice(
 // modding ecosystem (and presumably Gamepads.DAT) was validated against.
 static LPDIENUMDEVICESCALLBACKA g_gameEnumDevCb = nullptr;
 static LPVOID                   g_gameEnumDevRef = nullptr;
+static int                      g_realJoyCountThisEnum = 0;
+static bool                     g_enumStoppedByGame    = false;
 
 static BOOL CALLBACK EnumDevicesThunk(LPCDIDEVICEINSTANCEA inst, LPVOID ref)
 {
     DIDEVICEINSTANCEA spoofed = *inst;
     BYTE devClass = (BYTE)GET_DIDEVICE_TYPE(inst->dwDevType);
     bool isJoy = (devClass != DI8DEVTYPE_KEYBOARD) && (devClass != DI8DEVTYPE_MOUSE);
+    if (isJoy) ++g_realJoyCountThisEnum;
 
     if (g_cfg.spoofVidPid && isJoy) {
         // Overwrite only the leading VID/PID DWORD of guidProduct, keep the
@@ -540,7 +826,9 @@ static BOOL CALLBACK EnumDevicesThunk(LPCDIDEVICEINSTANCEA inst, LPVOID ref)
         LOG("EnumDevices spoof: '%s' guidProduct 0x%08lX -> 0x%08lX",
             inst->tszProductName, orig, vidpid);
     }
-    return g_gameEnumDevCb ? g_gameEnumDevCb(&spoofed, g_gameEnumDevRef) : DIENUM_CONTINUE;
+    BOOL ret = g_gameEnumDevCb ? g_gameEnumDevCb(&spoofed, g_gameEnumDevRef) : DIENUM_CONTINUE;
+    if (ret == DIENUM_STOP) g_enumStoppedByGame = true;
+    return ret;
 }
 
 static HRESULT STDMETHODCALLTYPE Hook_EnumDevices(
@@ -550,8 +838,21 @@ static HRESULT STDMETHODCALLTYPE Hook_EnumDevices(
     if (!g_origEnumDevices) return DIERR_NOTINITIALIZED;
     g_gameEnumDevCb  = cb;
     g_gameEnumDevRef = ref;
+    g_realJoyCountThisEnum = 0;
+    g_enumStoppedByGame    = false;
     HRESULT hr = g_origEnumDevices(self, dwDevType, &EnumDevicesThunk, nullptr, flags);
     g_gameEnumDevCb = nullptr;
+
+    // No real joystick-class device was found in this enumeration - inject
+    // our fully synthetic one so the game creates SOME joystick device
+    // regardless of launch order (see VirtualJoystickDevice's file header).
+    bool wantsGameCtrl = (dwDevType == 0 /*DI8DEVCLASS_ALL*/ || dwDevType == DI8DEVCLASS_GAMECTRL);
+    if (SUCCEEDED(hr) && wantsGameCtrl && g_realJoyCountThisEnum == 0 && !g_enumStoppedByGame && cb) {
+        DIDEVICEINSTANCEA fake;
+        VirtualJoystickDevice::FillInstance(fake);
+        LOG("EnumDevices: no real joystick present, injecting synthetic device '%s'", fake.tszProductName);
+        cb(&fake, ref);
+    }
     return hr;
 }
 
